@@ -1,0 +1,3 @@
+pymongo>=4.6,<5.0
+# 'dnspython' is required for mongodb+srv:// (Atlas) connection strings.
+dnspython>=2.4
