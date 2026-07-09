@@ -151,6 +151,35 @@ it go to `--url2`.
 | `--no-date-target {url1,url2,both,skip}` | Where to send collections with no date field (default url1). |
 | `--inspect` / `--dry-run`  | Inspect source / preview counts without writing.                     |
 
+## Splitting across THREE clusters (`split_three.py`)
+
+Use this when one date-split isn't enough and you want to spread collections
+across three free-tier clusters. Default routing for `nse_fno`:
+
+- **URL1** ← `stock_futures` dated **before** the cutoff (up to 2025)
+- **URL2** ← `stock_futures` dated **on/after** the cutoff (2026 → now)
+- **URL3** ← `spread_daily` + `spread_summary` (whole collections)
+
+```bash
+# 1) inspect
+python split_three.py --inspect --source "mongodb://localhost:27017"
+
+# 2) dry-run
+python split_three.py --source "mongodb://localhost:27017" \
+  --url1 "mongodb+srv://...A" --url2 "mongodb+srv://...B" --url3 "mongodb+srv://...C" \
+  --cutoff 2026-01-01 --date-field opened_at --dry-run
+
+# 3) run for real, with indexes + a saved log
+python split_three.py --source "mongodb://localhost:27017" \
+  --url1 "mongodb+srv://...A" --url2 "mongodb+srv://...B" --url3 "mongodb+srv://...C" \
+  --cutoff 2026-01-01 --date-field opened_at --drop --indexes --log-file run.log
+```
+
+Customise the routing with `--date-collections` (split by date across URL1/URL2)
+and `--whole-collections` (sent whole to URL3). The run prints live per-URL
+progress and a final summary table showing exactly how many docs went to URL1,
+URL2, and URL3.
+
 ## Alternative: mongodump / mongorestore
 
 If you have the MongoDB Database Tools installed you can also do:
