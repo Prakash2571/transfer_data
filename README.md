@@ -90,6 +90,67 @@ python transfer.py --dest "mongodb+srv://..." --upsert
 - The script prints progress per collection and redacts credentials in its logs.
 - Atlas free tier (M0) has a 512 MB storage limit — check your data size fits.
 
+## Splitting a database by date across two clusters (`split_by_date.py`)
+
+Use this when your data doesn't fit one free-tier (M0) cluster and you want to
+split it by a date field — e.g. everything **up to 31 Dec 2025** on one cluster
+and **2026 onward** on a second cluster.
+
+> **Why rebuild instead of deleting old docs?** On Atlas M0, deleting documents
+> does **not** free disk space (WiredTiger keeps it and M0 can't run `compact`).
+> **Dropping** a collection and re-importing only the slice you want *does*
+> reclaim space. So this script reads from your complete local DB and loads only
+> the matching date range into each destination.
+
+### Step 1 — inspect (find the right date field per collection)
+
+```bash
+python split_by_date.py --inspect --source "mongodb://localhost:27017"
+```
+This prints each collection's fields, detected datetime fields, and their
+min/max — so you know exactly which field to split on.
+
+### Step 2 — dry run (preview counts, writes nothing)
+
+```bash
+python split_by_date.py \
+  --source "mongodb://localhost:27017" \
+  --url1 "mongodb+srv://...fnodata" \
+  --url2 "mongodb+srv://...fnodata2" \
+  --cutoff 2026-01-01 \
+  --date-field opened_at \
+  --dry-run
+```
+
+### Step 3 — run for real (drop + load slices + copy indexes to both)
+
+```bash
+python split_by_date.py \
+  --source "mongodb://localhost:27017" \
+  --url1 "mongodb+srv://...fnodata" \
+  --url2 "mongodb+srv://...fnodata2" \
+  --cutoff 2026-01-01 \
+  --date-field opened_at \
+  --drop --indexes
+```
+
+`--cutoff` is a UTC boundary: docs **before** it go to `--url1`, docs **on/after**
+it go to `--url2`.
+
+### Options
+
+| Option                     | What it does                                                           |
+|----------------------------|------------------------------------------------------------------------|
+| `--cutoff 2026-01-01`      | Boundary date (UTC). Before → URL1, on/after → URL2.                   |
+| `--date-field opened_at`   | Default date field for all collections.                               |
+| `--date-fields "a=f1,b=f2"`| Per-collection date-field overrides.                                  |
+| `--drop`                   | Drop each destination collection first (reclaims space).              |
+| `--indexes`                | Copy source indexes to both destinations.                            |
+| `--upsert`                 | Upsert by `_id` — safe to re-run.                                     |
+| `--undated {url1,url2,both,skip}` | Where to put docs missing the date field (default url1).       |
+| `--no-date-target {url1,url2,both,skip}` | Where to send collections with no date field (default url1). |
+| `--inspect` / `--dry-run`  | Inspect source / preview counts without writing.                     |
+
 ## Alternative: mongodump / mongorestore
 
 If you have the MongoDB Database Tools installed you can also do:
