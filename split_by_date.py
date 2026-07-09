@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Split a MongoDB database BY DATE into two destinations.
+Split a MongoDB database BY DATE into two destinations, with clear logging.
 
 Reads from a single source (your complete local DB) and writes:
   * URL1  <-  documents dated  BEFORE  the cutoff   (e.g. up to 31 Dec 2025)
@@ -10,8 +10,10 @@ Why rebuild instead of "delete 2026 docs from URL1"?
   On MongoDB Atlas free tier (M0), deleting documents does NOT return disk
   space (WiredTiger keeps it, and M0 can't run `compact`). DROPPING a
   collection and re-importing only the data you want DOES reclaim space.
-  So this script drops each destination collection (with --drop) and loads
-  only the matching slice. That is what actually frees your quota.
+
+Every action is logged with a timestamp and clearly labelled URL1 / URL2 so you
+can watch exactly where each document goes. Add --log-file run.log to also save
+the full log to a file you can review afterwards.
 
 Typical workflow
 ----------------
@@ -19,28 +21,14 @@ Typical workflow
 python split_by_date.py --inspect --source "mongodb://localhost:27017"
 
 # 2) Dry run: preview how many docs go to each side (writes nothing)
-python split_by_date.py \
-    --source "mongodb://localhost:27017" \
-    --url1 "mongodb+srv://...fnodata" \
-    --url2 "mongodb+srv://...fnodata2" \
-    --cutoff 2026-01-01 \
-    --date-field opened_at \
-    --dry-run
+python split_by_date.py --source "mongodb://localhost:27017" \
+    --url1 "mongodb+srv://...fnodata" --url2 "mongodb+srv://...fnodata2" \
+    --cutoff 2026-01-01 --date-field opened_at --dry-run
 
 # 3) For real: drop destinations, load the slices, copy indexes to both
-python split_by_date.py \
-    --source "mongodb://localhost:27017" \
-    --url1 "mongodb+srv://...fnodata" \
-    --url2 "mongodb+srv://...fnodata2" \
-    --cutoff 2026-01-01 \
-    --date-field opened_at \
-    --drop --indexes
-
-Per-collection date fields
---------------------------
-If collections use different date fields, pass a mapping:
-    --date-fields "stock_futures=opened_at,spread_daily=date"
-Anything not in the mapping falls back to --date-field, then to auto-detect.
+python split_by_date.py --source "mongodb://localhost:27017" \
+    --url1 "mongodb+srv://...fnodata" --url2 "mongodb+srv://...fnodata2" \
+    --cutoff 2026-01-01 --date-field opened_at --drop --indexes --log-file run.log
 """
 
 import argparse
@@ -54,6 +42,31 @@ try:
     from pymongo.errors import BulkWriteError, PyMongoError
 except ImportError:
     sys.exit("pymongo not installed. Run: pip install -r requirements.txt")
+
+
+# --------------------------------------------------------------------------- #
+# Logging: timestamped lines, optionally tee'd to a file.
+# --------------------------------------------------------------------------- #
+_LOG_FH = None
+
+
+def log(msg="", *, same_line=False, indent=0):
+    """Print a timestamped, indented log line (and mirror it to the log file)."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    prefix = f"[{ts}] " + ("  " * indent)
+    line = prefix + msg
+    if same_line:
+        sys.stdout.write("\r" + line)
+        sys.stdout.flush()
+    else:
+        print(line)
+    if _LOG_FH:
+        _LOG_FH.write(line + "\n")
+        _LOG_FH.flush()
+
+
+def rule(char="=", width=64):
+    log(char * width)
 
 
 def parse_args():
@@ -94,6 +107,8 @@ def parse_args():
                    help="Only inspect the source: show fields, detected date fields, min/max.")
     p.add_argument("--dry-run", action="store_true",
                    help="Show split counts without writing.")
+    p.add_argument("--log-file", default=None,
+                   help="Also write the full run log to this file.")
     return p.parse_args()
 
 
@@ -105,8 +120,17 @@ def redact(uri):
     return f"{scheme}://***:***@{host}" if scheme else f"***:***@{host}"
 
 
+def host_of(uri):
+    """Short host label for logs, e.g. 'cluster0.abcde.mongodb.net'."""
+    if not uri:
+        return "(none)"
+    rest = uri.split("://", 1)[-1]
+    if "@" in rest:
+        rest = rest.split("@", 1)[1]
+    return rest.split("/")[0].split("?")[0]
+
+
 def parse_cutoff(s):
-    # Accept 'YYYY-MM-DD' or full ISO; treat naive as UTC.
     s = s.strip().replace("Z", "+00:00")
     try:
         dt = datetime.fromisoformat(s)
@@ -136,7 +160,6 @@ def parse_field_map(s):
 
 
 def detect_date_fields(sample):
-    """Return top-level field names in a sample doc whose value is a datetime."""
     return [k for k, v in sample.items() if isinstance(v, datetime)]
 
 
@@ -148,7 +171,6 @@ def resolve_date_field(coll_name, field_map, default_field, sample):
     detected = detect_date_fields(sample or {})
     if len(detected) == 1:
         return detected[0]
-    # Prefer common names when several are present.
     for pref in ("opened_at", "closed_at", "date", "timestamp", "created_at", "ts"):
         if pref in detected:
             return pref
@@ -160,27 +182,29 @@ def human(n):
 
 
 def inspect(src_db, colls):
-    print("\nSOURCE INSPECTION")
-    print("=================")
+    rule()
+    log("SOURCE INSPECTION")
+    rule()
     for name in colls:
         coll = src_db[name]
         total = coll.estimated_document_count()
         sample = coll.find_one() or {}
         date_fields = detect_date_fields(sample)
-        print(f"\n[{name}]  {human(total)} document(s)")
-        print(f"  top-level fields : {list(sample.keys())}")
-        print(f"  datetime fields  : {date_fields or '(none detected in sample)'}")
+        log("")
+        log(f"[{name}]  {human(total)} document(s)")
+        log(f"top-level fields : {list(sample.keys())}", indent=1)
+        log(f"datetime fields  : {date_fields or '(none detected in sample)'}", indent=1)
         for f in date_fields:
-            lo = coll.find({f: {"$type": "date"}}).sort(f, 1).limit(1)
-            hi = coll.find({f: {"$type": "date"}}).sort(f, -1).limit(1)
-            lo = next(lo, {}).get(f)
-            hi = next(hi, {}).get(f)
+            lo = next(coll.find({f: {"$type": "date"}}).sort(f, 1).limit(1), {}).get(f)
+            hi = next(coll.find({f: {"$type": "date"}}).sort(f, -1).limit(1), {}).get(f)
             missing = coll.count_documents({f: {"$exists": False}})
-            print(f"    - {f}: min={lo}  max={hi}  missing_in={human(missing)}")
+            log(f"- {f}: min={lo}  max={hi}  missing_in={human(missing)}", indent=2)
+    log("")
+    log("(inspection only; nothing written)")
 
 
 def copy_indexes(src_coll, dst_coll):
-    copied = 0
+    copied, failed = 0, 0
     for iname, spec in src_coll.index_information().items():
         if iname == "_id_":
             continue
@@ -190,8 +214,9 @@ def copy_indexes(src_coll, dst_coll):
             dst_coll.create_index(keys, name=iname, **options)
             copied += 1
         except PyMongoError as e:
-            print(f"      ! index '{iname}' failed: {e}")
-    return copied
+            failed += 1
+            log(f"! index '{iname}' failed: {e}", indent=3)
+    return copied, failed
 
 
 def flush(dst_coll, batch, upsert):
@@ -204,17 +229,24 @@ def flush(dst_coll, batch, upsert):
     except BulkWriteError as bwe:
         n_ok = bwe.details.get("nInserted", 0) + bwe.details.get("nUpserted", 0)
         n_err = len(bwe.details.get("writeErrors", []))
-        print(f"      ! {n_err} write error(s) (inserted {n_ok}). Consider --upsert/--drop.")
+        log(f"! {n_err} write error(s) (inserted {n_ok}). Consider --upsert/--drop.", indent=3)
         return n_ok
 
 
-def copy_query(src_coll, dst_coll, query, args, label):
+def copy_query(src_coll, dst_coll, dst_label, query, args):
+    """Copy docs matching `query` from src to dst, logging live progress."""
     total = src_coll.count_documents(query)
-    print(f"    -> {label}: {human(total)} doc(s)", end="", flush=True)
-    if args.dry_run or dst_coll is None or total == 0:
-        print(" [no write]" if (args.dry_run or dst_coll is None) else "")
+
+    if dst_coll is None or args.dry_run:
+        tag = "[dry-run, no write]" if args.dry_run else "[skipped]"
+        log(f"{dst_label:<14} {human(total):>10} doc(s)  {tag}", indent=2)
         return total
+    if total == 0:
+        log(f"{dst_label:<14} {human(total):>10} doc(s)  (nothing to copy)", indent=2)
+        return 0
+
     written, batch = 0, []
+    start = time.time()
     cursor = src_coll.find(query, no_cursor_timeout=True)
     try:
         for doc in cursor:
@@ -222,12 +254,24 @@ def copy_query(src_coll, dst_coll, query, args, label):
             if len(batch) >= args.batch_size:
                 written += flush(dst_coll, batch, args.upsert)
                 batch = []
+                _progress(dst_label, written, total, start)
         if batch:
             written += flush(dst_coll, batch, args.upsert)
+        _progress(dst_label, written, total, start, final=True)
     finally:
         cursor.close()
-    print(f"  -> wrote {human(written)}")
     return written
+
+
+def _progress(dst_label, written, total, start, final=False):
+    pct = (written / total * 100) if total else 100
+    rate = written / (time.time() - start + 1e-9)
+    msg = (f"{dst_label:<14} {human(written):>10}/{human(total)} "
+           f"({pct:5.1f}%)  {rate:>8,.0f} docs/s")
+    log(msg, indent=2, same_line=not final)
+    if final:
+        return
+    # keep the carriage-return line clean; newline printed on final call
 
 
 def targets_for(choice, d1, d2):
@@ -235,38 +279,42 @@ def targets_for(choice, d1, d2):
 
 
 def main():
+    global _LOG_FH
     args = parse_args()
+    if args.log_file:
+        _LOG_FH = open(args.log_file, "w", encoding="utf-8")
+
     cutoff = parse_cutoff(args.cutoff)
     field_map = parse_field_map(args.date_fields)
 
-    print("Split-by-date")
-    print("=============")
-    print(f"source : {redact(args.source)}  db={args.source_db}")
-    print(f"cutoff : {cutoff.isoformat()}  (before -> URL1, on/after -> URL2)")
+    rule()
+    log("SPLIT-BY-DATE")
+    rule()
+    log(f"source : {host_of(args.source)}  db={args.source_db}")
+    log(f"cutoff : {cutoff.isoformat()}")
+    log("routing: dated BEFORE cutoff -> URL1   |   dated ON/AFTER cutoff -> URL2")
 
     try:
         src_client = MongoClient(args.source, serverSelectionTimeoutMS=8000)
         src_client.admin.command("ping")
     except PyMongoError as e:
-        sys.exit(f"\nFailed to connect to SOURCE: {e}")
+        sys.exit(f"Failed to connect to SOURCE: {e}")
     src_db = src_client[args.source_db]
 
     all_colls = src_db.list_collection_names()
     colls = args.collections or all_colls
     missing = [c for c in colls if c not in all_colls]
     if missing:
-        sys.exit(f"\nCollections not found: {missing}. Available: {all_colls}")
+        sys.exit(f"Collections not found: {missing}. Available: {all_colls}")
 
     if args.inspect:
         inspect(src_db, colls)
-        print("\n(inspection only; nothing written)")
         return
 
-    # Connect destinations (unless dry-run)
     d1_db = d2_db = None
     if not args.dry_run:
         if not args.url1 and not args.url2:
-            sys.exit("\nProvide --url1 and/or --url2 (or use --dry-run).")
+            sys.exit("Provide --url1 and/or --url2 (or use --dry-run).")
         if args.url1:
             c1 = MongoClient(args.url1, serverSelectionTimeoutMS=15000)
             c1.admin.command("ping")
@@ -275,65 +323,87 @@ def main():
             c2 = MongoClient(args.url2, serverSelectionTimeoutMS=15000)
             c2.admin.command("ping")
             d2_db = c2[args.url2_db or args.source_db]
-    print(f"URL1   : {redact(args.url1) or '(none)'}")
-    print(f"URL2   : {redact(args.url2) or '(none)'}")
+    log(f"URL1   : {host_of(args.url1)}  db={args.url1_db or args.source_db}")
+    log(f"URL2   : {host_of(args.url2)}  db={args.url2_db or args.source_db}")
+    if args.dry_run:
+        log("mode   : DRY-RUN (no data will be written)")
 
-    grand1 = grand2 = 0
+    # summary[collection] = {"URL1": n, "URL2": n}
+    summary = {}
+    run_start = time.time()
+
     for name in colls:
         src_coll = src_db[name]
         sample = src_coll.find_one() or {}
         field = resolve_date_field(name, field_map, args.date_field, sample)
         d1 = d1_db[name] if d1_db is not None else None
         d2 = d2_db[name] if d2_db is not None else None
-        print(f"\n[{name}]  date field: {field or '(none)'}")
+        summary[name] = {"URL1": 0, "URL2": 0}
+
+        log("")
+        rule("-")
+        log(f"COLLECTION [{name}]   split field: {field or '(none)'}")
+        rule("-")
 
         if args.drop and not args.dry_run:
             if d1 is not None:
                 d1.drop()
             if d2 is not None:
                 d2.drop()
-            print("    dropped destination collection(s)")
+            log("dropped destination collection(s) on URL1/URL2", indent=1)
 
         if not field:
-            # No usable date field: route whole collection per --no-date-target
+            log(f"no date field -> whole collection goes to: {args.no_date_target}", indent=1)
             for dst in targets_for(args.no_date_target, d1, d2):
-                grand = copy_query(src_coll, dst, {}, args,
-                                   f"whole -> {'URL1' if dst is d1 else 'URL2'}")
-                if dst is d1:
-                    grand1 += grand
-                else:
-                    grand2 += grand
-            if args.no_date_target == "skip":
-                print("    skipped (no date field)")
+                which = "URL1" if dst is d1 else "URL2"
+                n = copy_query(src_coll, dst, f"whole->{which}", {}, args)
+                summary[name][which] += n
         else:
-            before_q = {field: {"$lt": cutoff}}
-            after_q = {field: {"$gte": cutoff}}
-            grand1 += copy_query(src_coll, d1, before_q, args, "before cutoff -> URL1")
-            grand2 += copy_query(src_coll, d2, after_q, args, "on/after cutoff -> URL2")
+            n1 = copy_query(src_coll, d1, "before->URL1", {field: {"$lt": cutoff}}, args)
+            n2 = copy_query(src_coll, d2, "on/after->URL2", {field: {"$gte": cutoff}}, args)
+            summary[name]["URL1"] += n1
+            summary[name]["URL2"] += n2
 
-            # Docs missing the date field
             missing_q = {field: {"$exists": False}}
             n_missing = src_coll.count_documents(missing_q)
             if n_missing:
-                print(f"    note: {human(n_missing)} doc(s) missing '{field}' "
-                      f"-> routed to {args.undated}")
+                log(f"{human(n_missing)} doc(s) missing '{field}' -> routed to {args.undated}", indent=1)
                 for dst in targets_for(args.undated, d1, d2):
-                    g = copy_query(src_coll, dst, missing_q, args,
-                                   f"undated -> {'URL1' if dst is d1 else 'URL2'}")
-                    if dst is d1:
-                        grand1 += g
-                    else:
-                        grand2 += g
+                    which = "URL1" if dst is d1 else "URL2"
+                    n = copy_query(src_coll, dst, f"undated->{which}", missing_q, args)
+                    summary[name][which] += n
 
         if args.indexes and not args.dry_run:
             if d1 is not None:
-                print(f"    URL1 indexes copied: {copy_indexes(src_coll, d1)}")
+                c, f = copy_indexes(src_coll, d1)
+                log(f"URL1 indexes copied: {c}" + (f" ({f} failed)" if f else ""), indent=1)
             if d2 is not None:
-                print(f"    URL2 indexes copied: {copy_indexes(src_coll, d2)}")
+                c, f = copy_indexes(src_coll, d2)
+                log(f"URL2 indexes copied: {c}" + (f" ({f} failed)" if f else ""), indent=1)
 
-    print(f"\nDone. Documents to URL1: {human(grand1)}   URL2: {human(grand2)}")
+    # ---- final summary table ----
+    log("")
+    rule()
+    log("SUMMARY  (documents routed per collection)")
+    rule()
+    log(f"{'collection':<22}{'-> URL1':>14}{'-> URL2':>14}{'total':>12}")
+    log("-" * 64)
+    t1 = t2 = 0
+    for name, s in summary.items():
+        t1 += s["URL1"]
+        t2 += s["URL2"]
+        log(f"{name:<22}{human(s['URL1']):>14}{human(s['URL2']):>14}{human(s['URL1'] + s['URL2']):>12}")
+    log("-" * 64)
+    log(f"{'TOTAL':<22}{human(t1):>14}{human(t2):>14}{human(t1 + t2):>12}")
+    log("")
+    log(f"URL1 ({host_of(args.url1)}) received {human(t1)} document(s)")
+    log(f"URL2 ({host_of(args.url2)}) received {human(t2)} document(s)")
+    log(f"elapsed: {time.time() - run_start:.1f}s")
     if args.dry_run:
-        print("(dry-run: nothing was written)")
+        log("mode: DRY-RUN -> nothing was actually written")
+    if _LOG_FH:
+        log(f"full log saved to: {args.log_file}")
+        _LOG_FH.close()
 
 
 if __name__ == "__main__":
